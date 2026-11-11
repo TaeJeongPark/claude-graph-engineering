@@ -1,0 +1,2 @@
+# 셸 스크립트와 훅은 CRLF 로 체크아웃되면 실행되지 않는다. Windows 에서도 LF 로 둔다.
+* text=auto eol=lf
