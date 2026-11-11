@@ -1,0 +1,224 @@
+#!/usr/bin/env node
+// graph-check: 그래프(Workflow 스크립트)를 토큰을 쓰지 않고 검사한다.
+//
+//   graph-check <script.js>                    정적 검사(meta, 문법, 금지 API, phase 일치)
+//   graph-check <script.js> --sim              agent()를 스텁으로 바꿔 그래프를 끝까지 실행
+//       --args '<json>'                        스크립트의 args 전역
+//       --fixture <file.mjs>                   export default (prompt, opts, n) => 값 | undefined
+//                                              undefined 를 돌려주면 schema 로 스텁을 만든다
+//       --quiet                                호출 추적을 생략하고 결과만 출력
+//
+// 종료 코드: 0 통과 · 1 검사 실패 또는 실행 중 예외 · 2 사용법 오류
+//
+// 확장자가 없는 실행 파일이라 CommonJS 로 쓴다(구버전 Node 는 이런 파일의 import 문을 읽지 못한다).
+const { readFileSync } = require('node:fs')
+const { resolve } = require('node:path')
+const { pathToFileURL } = require('node:url')
+
+const usage = (msg) => {
+  if (msg) console.error(`graph-check: ${msg}`)
+  console.error("사용법: graph-check <script.js> [--sim] [--args '<json>'] [--fixture <file.mjs>] [--quiet]")
+  process.exit(2)
+}
+const opt = { sim: false, quiet: false, args: undefined, fixture: undefined }
+let file
+for (let argv = process.argv.slice(2), i = 0; i < argv.length; i++) {
+  const a = argv[i]
+  if (a === '--sim') opt.sim = true
+  else if (a === '--quiet') opt.quiet = true
+  else if (a === '-h' || a === '--help') usage()
+  else if (a === '--args' || a === '--fixture') {
+    if (i + 1 >= argv.length) usage(`${a} 에 값이 없다.`)
+    opt[a.slice(2)] = argv[++i]
+  } else if (a.startsWith('-')) usage(`모르는 옵션: ${a}`)
+  else if (file) usage(`스크립트는 하나만 받는다: ${a}`)
+  else file = a
+}
+if (!file) usage()
+
+let source
+try {
+  source = readFileSync(file, 'utf8')
+} catch (e) {
+  usage(`${file} 을 읽을 수 없다: ${e.message}`)
+}
+const errors = []
+const warnings = []
+
+// ── meta 추출: 스크립트는 `export const meta = {` 로 시작해야 하고, 순수 리터럴이어야 한다.
+const metaStart = source.search(/export\s+const\s+meta\s*=\s*\{/)
+let meta = null
+let body = source
+if (metaStart === -1) {
+  errors.push('`export const meta = {...}` 가 없다.')
+} else {
+  if (source.slice(0, metaStart).replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '').trim() !== '') {
+    errors.push('`export const meta` 앞에 주석 외의 코드가 있다. meta 가 스크립트의 첫 문장이어야 한다.')
+  }
+  const open = source.indexOf('{', metaStart)
+  const close = matchBrace(source, open)
+  if (close === -1) {
+    errors.push('meta 객체의 닫는 중괄호를 찾지 못했다.')
+  } else {
+    const literal = source.slice(open, close + 1)
+    if (/\$\{/.test(literal)) errors.push('meta 에 템플릿 보간(${...})이 있다. 순수 리터럴이어야 한다.')
+    try {
+      // 스크립트 밖에서 평가한다. 스크립트 안의 변수·함수를 참조하면 ReferenceError 가 난다.
+      meta = Function(`"use strict"; return (${literal})`)()
+    } catch (e) {
+      errors.push(`meta 가 순수 리터럴이 아니다: ${e.message}`)
+    }
+    body = source.slice(0, metaStart) + source.slice(metaStart).replace(/export\s+const\s+meta/, 'const meta')
+  }
+}
+
+if (meta) {
+  for (const k of ['name', 'description']) {
+    if (typeof meta[k] !== 'string' || !meta[k]) errors.push(`meta.${k} 가 없다.`)
+  }
+  const declared = new Set((meta.phases || []).map((p) => p.title))
+  const used = new Set()
+  for (const m of body.matchAll(/\bphase\(\s*(['"`])([^'"`]+)\1/g)) used.add(m[2])
+  for (const m of body.slice(body.indexOf('const meta')).matchAll(/\bphase:\s*(['"`])([^'"`$]+)\1/g)) used.add(m[2])
+  for (const t of used) if (!declared.has(t)) warnings.push(`phase "${t}" 가 meta.phases 에 없다(진행 표시가 별도 그룹으로 나뉜다).`)
+  for (const t of declared) if (!used.has(t)) warnings.push(`meta.phases 의 "${t}" 를 쓰는 호출이 없다.`)
+}
+
+// ── 금지 API: 재개(resume)를 깨는 비결정 호출과, 런타임에 없는 Node API
+const code = body.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')
+const banned = [
+  [/\bDate\.now\s*\(/, 'Date.now() — 타임스탬프는 args 로 받는다.'],
+  [/\bMath\.random\s*\(/, 'Math.random() — 무작위가 필요하면 인덱스로 프롬프트를 바꾼다.'],
+  [/\bnew\s+Date\s*\(\s*\)/, '인자 없는 new Date()'],
+  [/\brequire\s*\(/, 'require() — 파일시스템·Node API 는 쓸 수 없다.'],
+  [/^\s*import\s/m, 'import — 스크립트는 단일 파일이어야 한다.'],
+  [/\bprocess\.(env|argv|cwd|exit)\b/, 'process.* — Node API 는 쓸 수 없다.'],
+]
+for (const [re, msg] of banned) if (re.test(code)) errors.push(`금지된 호출: ${msg}`)
+
+// ── 문법: 본문은 async 컨텍스트에서 실행된다(top-level await / return 허용). TS 문법은 여기서 걸린다.
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const params = ['agent', 'parallel', 'pipeline', 'phase', 'log', 'args', 'budget', 'workflow']
+let run = null
+try {
+  run = new AsyncFunction(...params, body)
+} catch (e) {
+  errors.push(`문법 오류: ${e.message}`)
+}
+
+for (const w of warnings) console.error(`경고: ${w}`)
+for (const e of errors) console.error(`오류: ${e}`)
+if (errors.length) process.exit(1)
+if (!opt.sim) {
+  console.log(`통과: ${meta.name} — 정적 검사 (${warnings.length} 경고)`)
+  process.exit(0)
+}
+
+// ── 시뮬레이션
+let simArgs
+if (opt.args !== undefined) {
+  try {
+    simArgs = JSON.parse(opt.args)
+  } catch {
+    simArgs = opt.args // JSON 이 아니면 문자열 그대로
+  }
+}
+const quiet = opt.quiet
+let fixture = null
+
+let calls = 0
+let active = 0
+let peak = 0
+let currentPhase = ''
+const trace = (line) => quiet || console.error(line)
+
+async function agent(prompt, opts = {}) {
+  const n = ++calls
+  if (calls > 1000) throw new Error('agent() 호출이 1000회를 넘었다(런타임 상한). 루프에 정지 조건이 있는지 확인한다.')
+  if (opts.schema && (opts.schema.type !== 'object' || !opts.schema.properties)) {
+    throw new Error(`schema 의 루트는 {type:'object', properties:{...}} 여야 한다 (${opts.label || n})`)
+  }
+  for (const r of (opts.schema && opts.schema.required) || []) {
+    if (!(r in opts.schema.properties)) throw new Error(`schema.required 의 "${r}" 가 properties 에 없다 (${opts.label || n})`)
+  }
+  active++
+  peak = Math.max(peak, active)
+  trace(`  [${String(n).padStart(3)}] ${(opts.phase || currentPhase || '-').padEnd(10)} ${opts.label || '(label 없음)'}${opts.agentType ? ` <${opts.agentType}>` : ''}${opts.model ? ` model=${opts.model}` : ''}${opts.isolation ? ` isolation=${opts.isolation}` : ''}`)
+  await new Promise((r) => setTimeout(r, 1)) // 병렬 호출이 실제로 겹치게 한다
+  let out = fixture ? await fixture(prompt, opts, n) : undefined
+  if (out === undefined) out = opts.schema ? stub(opts.schema) : `stub:${opts.label || n}`
+  active--
+  return out
+}
+
+function stub(s) {
+  if (s.enum) return s.enum[0]
+  switch (s.type) {
+    case 'object': {
+      const o = {}
+      for (const [k, v] of Object.entries(s.properties || {})) o[k] = stub(v)
+      return o
+    }
+    case 'array':
+      return s.minItems ? Array.from({ length: s.minItems }, () => stub(s.items || {})) : []
+    case 'boolean':
+      return true
+    case 'integer':
+    case 'number':
+      return s.minimum ?? 0
+    case 'string':
+      return ''
+    default:
+      return null
+  }
+}
+
+const settle = (p) => Promise.resolve().then(p).catch((e) => (trace(`  ! 예외 → null: ${e.message}`), null))
+const parallel = (thunks) => {
+  if (thunks.length > 4096) throw new Error('parallel() 은 최대 4096개까지 받는다.')
+  return Promise.all(thunks.map((t) => settle(t)))
+}
+const pipeline = (items, ...stages) =>
+  Promise.all(
+    items.map((item, i) =>
+      settle(async () => {
+        let acc = item
+        for (const stage of stages) acc = await stage(acc, item, i)
+        return acc
+      }),
+    ),
+  )
+const phase = (title) => {
+  currentPhase = title
+  trace(`── ${title}`)
+}
+const log = (m) => trace(`  · ${m}`)
+const budget = { total: null, spent: () => 0, remaining: () => Infinity }
+const workflow = async () => {
+  throw new Error('graph-check 는 중첩 workflow() 를 시뮬레이션하지 않는다.')
+}
+
+;(async () => {
+  if (opt.fixture) fixture = (await import(pathToFileURL(resolve(opt.fixture)).href)).default
+  const result = await run(agent, parallel, pipeline, phase, log, simArgs, budget, workflow)
+  trace(`── 끝: agent() ${calls}회, 최대 동시 실행 ${peak}`)
+  console.log(JSON.stringify(result, null, 2))
+})().catch((e) => {
+  console.error(`오류: 실행 중 예외 — ${e.stack || e.message}`)
+  process.exit(1)
+})
+
+function matchBrace(text, open) {
+  let depth = 0
+  let quote = null
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]
+    if (quote) {
+      if (c === '\\') i++
+      else if (c === quote) quote = null
+    } else if (c === '"' || c === "'" || c === '`') quote = c
+    else if (c === '{') depth++
+    else if (c === '}' && --depth === 0) return i
+  }
+  return -1
+}
